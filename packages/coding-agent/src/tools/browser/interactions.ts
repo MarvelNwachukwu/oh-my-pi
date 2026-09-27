@@ -254,39 +254,67 @@ export async function fillViaHandle(
 	await untilAborted(signal, () => type(value));
 }
 
-/** Resolve text-query matches to the first visible clickable candidate in document order. */
+/**
+ * Resolve text-query matches to one clickable target. Each match is promoted to its nearest
+ * interactive ancestor; hidden or zero-size candidates are dropped; on-screen candidates win in
+ * visual order before off-screen ones, which `clickElement` scrolls into view.
+ *
+ * Geometry is read synchronously from layout rather than via `isIntersectingViewport()`: its
+ * IntersectionObserver never reports on tabs that produce no frames (backgrounded headless or
+ * relay tabs), and gating on it made below-the-fold matches unclickable.
+ */
 export async function resolveActionableQueryHandlerClickTarget(
 	handles: ElementHandle[],
+	signal?: AbortSignal,
 ): Promise<ElementHandle | null> {
-	const candidates: Array<{ handle: ElementHandle; x: number; y: number; owned: boolean }> = [];
+	const candidates: Array<{ handle: ElementHandle; inViewport: boolean; x: number; y: number; owned: boolean }> =
+		[];
 	for (const handle of handles) {
 		let candidate = handle;
 		let owned = false;
 		try {
-			const proxy = await handle.evaluateHandle(el =>
-				(el as Element).closest('a,button,[role="button"],[role="link"],input[type="button"],input[type="submit"]'),
+			const proxy = await untilAborted(signal, () =>
+				handle.evaluateHandle(el =>
+					(el as Element).closest(
+						'a,button,[role="button"],[role="link"],input[type="button"],input[type="submit"]',
+					),
+				),
 			);
 			const element = proxy.asElement();
 			if (element) {
 				candidate = element;
 				owned = candidate !== handle;
 			} else await proxy.dispose();
-			const rect = (await candidate.evaluate(el => {
-				const box = (el as Element).getBoundingClientRect();
-				return { x: box.left, y: box.top, width: box.width, height: box.height };
-			})) as { x: number; y: number; width: number; height: number };
-			if (rect.width >= 1 && rect.height >= 1 && (await candidate.isIntersectingViewport())) {
-				candidates.push({ handle: candidate, x: rect.x, y: rect.y, owned });
+			const geometry = (await untilAborted(signal, () =>
+				candidate.evaluate(el => {
+					const element = el as unknown as PageElement;
+					const page = globalThis as unknown as PageGlobals;
+					const box = element.getBoundingClientRect();
+					const style = page.getComputedStyle(element);
+					const visible =
+						box.width >= 1 &&
+						box.height >= 1 &&
+						style.visibility !== "hidden" &&
+						style.visibility !== "collapse";
+					const inViewport =
+						box.right > 0 && box.bottom > 0 && box.left < page.innerWidth && box.top < page.innerHeight;
+					return { visible, inViewport, x: box.left, y: box.top };
+				}),
+			)) as { visible: boolean; inViewport: boolean; x: number; y: number };
+			if (geometry.visible) {
+				candidates.push({ handle: candidate, inViewport: geometry.inViewport, x: geometry.x, y: geometry.y, owned });
 			} else if (owned) await candidate.dispose().catch(() => undefined);
 		} catch {
 			if (owned) await candidate.dispose().catch(() => undefined);
+			if (signal?.aborted) break;
 		}
 	}
-	candidates.sort((a, b) => a.y - b.y || a.x - b.x);
-	const winner = candidates.shift();
+	candidates.sort((a, b) => Number(b.inViewport) - Number(a.inViewport) || a.y - b.y || a.x - b.x);
+	const winner = signal?.aborted ? undefined : candidates.shift();
 	for (const candidate of candidates) {
 		if (candidate.owned) await candidate.handle.dispose().catch(() => undefined);
 	}
+	throwIfAborted(signal);
 	return winner?.handle ?? null;
 }
 
@@ -305,7 +333,7 @@ export async function clickQueryHandlerText(
 		const handles = (await untilAborted(clickSignal, () => page.$$(selector))) as ElementHandle[];
 		let target: ElementHandle | null = null;
 		try {
-			target = await resolveActionableQueryHandlerClickTarget(handles);
+			target = await resolveActionableQueryHandlerClickTarget(handles, clickSignal);
 			if (!target) {
 				await untilAborted(clickSignal, () => Bun.sleep(50));
 				continue;

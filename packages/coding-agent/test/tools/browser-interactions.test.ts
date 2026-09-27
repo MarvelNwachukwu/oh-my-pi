@@ -193,4 +193,36 @@ return {
 			await prelude.invoke({ action: "close", name: STARVED_TAB_NAME, kill: true }, context).catch(() => undefined);
 		}
 	}, 40_000);
+
+	// Recruitee's cover-letter toggle: the text node is followed by an empty span and an
+	// aria-hidden icon, and the button sits below the fold. The text/ click must promote the match to
+	// the button, scroll it into view, and not depend on IntersectionObserver (frame-starved tabs).
+	test("clicks a below-the-fold text/ match with icon children, including on a frame-starved tab", async () => {
+		const session = makeSession();
+		const prelude = createBrowserPrelude(session);
+		const name = `text-click-${crypto.randomUUID()}`;
+		const textHtml = `<!doctype html><div style="height: 3000px"></div>
+<button data-cy="x" onclick="window.clicks = (window.clicks || 0) + 1">Stattdessen hier schreiben<span></span><span aria-hidden="true"><svg width="10" height="10"></svg></span></button>`;
+		const context = { session, toolCallId: "browser-text-click" };
+		await prelude.invoke({ action: "open", name, url: `data:text/html,${encodeURIComponent(textHtml)}` }, context);
+		try {
+			const result = await prelude.invoke(
+				{
+					action: "run",
+					name,
+					code: `await tab.click("text/Stattdessen hier schreiben");
+await tab.evaluate(() => window.scrollTo(0, 0));
+const cdp = await page.createCDPSession();
+await cdp.send("Emulation.setVirtualTimePolicy", { policy: "pause" });
+await tab.click("text/Stattdessen hier schreiben");
+return await tab.evaluate(() => window.clicks);`,
+					timeout: 25,
+				},
+				context,
+			);
+			expect(valueFrom<number>(result)).toBe(2);
+		} finally {
+			await prelude.invoke({ action: "close", name, kill: true }, context).catch(() => undefined);
+		}
+	}, 40_000);
 });
