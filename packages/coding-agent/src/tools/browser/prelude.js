@@ -15,10 +15,24 @@
 		}
 		return source;
 	};
+	const isPlainObject = value => {
+		if (value === null || typeof value !== "object") return false;
+		const proto = Object.getPrototypeOf(value);
+		return proto === null || Object.getPrototypeOf(proto) === null;
+	};
+	// RegExps travel as markers at any depth (e.g. `handoff({ until: { url: /done/ } })`);
+	// functions only as top-level arguments.
+	const encodeRegExps = value => {
+		if (value instanceof RegExp) return { __omp_re: { source: value.source, flags: value.flags } };
+		if (Array.isArray(value)) return value.map(encodeRegExps);
+		if (isPlainObject(value)) {
+			return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, encodeRegExps(item)]));
+		}
+		return value;
+	};
 	const encodeArg = (label, value) => {
 		if (typeof value === "function") return { __omp_fn: serializeFunction(label, value) };
-		if (value instanceof RegExp) return { __omp_re: { source: value.source, flags: value.flags } };
-		return value;
+		return encodeRegExps(value);
 	};
 	const encodeArgs = (label, args) => {
 		const trimmed = [...args];
@@ -81,6 +95,7 @@
 		"select",
 		"uploadFile",
 		"waitForUrl",
+		"handoff",
 		"text",
 		"html",
 		"value",

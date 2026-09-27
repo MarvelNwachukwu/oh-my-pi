@@ -554,6 +554,36 @@ interface BrowserWaitOptions {
 	timeout?: number;
 }
 
+/** Completion signals for `tab.handoff()`; the first one that holds ends the wait. */
+interface BrowserHandoffUntil {
+	/** URL contains this string / matches this RegExp. */
+	url?: string | RegExp;
+	/** URL no longer contains this string / matches this RegExp (e.g. left `/login`). */
+	notUrl?: string | RegExp;
+	/** An element matching this selector exists. */
+	selector?: string;
+	/** An element matching this selector was present and is now gone (e.g. a CAPTCHA iframe). */
+	gone?: string;
+	/** Main-document body text contains this string / matches this RegExp. */
+	text?: string | RegExp;
+}
+
+/** Options for handing a tab to the user. */
+interface BrowserHandoffOptions {
+	/** What the user should do; shown in the omp UI and a terminal notification. */
+	message: string;
+	until: BrowserHandoffUntil;
+	/** Wait timeout in milliseconds; defaults to, and is capped by, the longest browser call budget (300s). */
+	timeout?: number;
+}
+
+/** How a handoff ended. */
+interface BrowserHandoffResult {
+	met: keyof BrowserHandoffUntil;
+	url: string;
+	elapsedMs: number;
+}
+
 /** Options for polling a predicate inside `tab.run`. */
 interface BrowserPollOptions extends BrowserWaitOptions {
 	/** Delay between predicate calls in milliseconds. */
@@ -1329,6 +1359,12 @@ interface BrowserTabHelpers {
 	uploadFile(selector: string, ...filePaths: string[]): Promise<void>;
 	/** Wait for the current URL to match a string or regular expression. */
 	waitForUrl(pattern: string | RegExp, options?: BrowserWaitOptions): Promise<string>;
+	/**
+	 * Hand the tab to the user (CAPTCHA, login, 2FA) and wait until they finish:
+	 * focuses the tab, shows `message` in the omp UI, then resolves on the first
+	 * `until` condition. Rejects on timeout. Never interacts with the page itself.
+	 */
+	handoff(options: BrowserHandoffOptions): Promise<BrowserHandoffResult>;
 	/** Start persistent CDP screencast recording to an MP4 or WebM path. */
 	recordStart(path: string, options?: BrowserRecordingOptions): Promise<BrowserRecordingStartResult>;
 	/** Stop and finalize the active recording. */

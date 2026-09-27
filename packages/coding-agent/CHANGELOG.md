@@ -19,6 +19,7 @@
 - Added a context-aware hint system for empty composers that displays suggestions based on agent activity and effort
 - Added an optional `scope` to the `retain` and `learn` tools, offered when `mnemopi.scoping` is `global` or `per-project-tagged`: `scope: "global"` stores a memory or lesson in the Mnemopi bank every project recalls instead of the current project's bank ([#13324](https://github.com/can1357/oh-my-pi/pull/13324) by [@alphastorm](https://github.com/alphastorm)).
 - Added `/btw` to the commands available from a focused subagent view; it asks about the focused agent's transcript instead of the main session's, keeps its side-conversation history separate from main and other agents, keeps streaming an answer after you leave the view, and its answers can be copied or followed up but not branched into the main session ([#13412](https://github.com/can1357/oh-my-pi/pull/13412), [#13431](https://github.com/can1357/oh-my-pi/pull/13431) by [@H4vC](https://github.com/H4vC))
+- Added `tab.handoff({ message, until, timeout })` to the browser Eval API: it focuses the tab (including relay tabs in your own Chrome), shows the message in the omp UI with a terminal notification, and waits until the URL changes, a selector appears or disappears, or text shows up, so you can clear a CAPTCHA or log in yourself before the agent continues
 
 ### Changed
 
@@ -49,6 +50,7 @@
 - Preserved MCP `structuredContent` in live tool result `details`, allowing eval callers to consume server data without parsing the model-facing JSON rendering; spilled results omit the duplicate structured payload from session persistence while retaining the artifact reference ([#13397](https://github.com/can1357/oh-my-pi/issues/13397), [#13398](https://github.com/can1357/oh-my-pi/pull/13398) by [@shawnkoh](https://github.com/shawnkoh)).
 - Fixed a Collab host ending with `a host is already connected for this room` after a brief network drop: when the relay still holds the dropped connection, the host now retries every few seconds for up to 150 s and reclaims its room, and a refused retry no longer resets the guest list or drops queued updates ([#12514](https://github.com/can1357/oh-my-pi/issues/12514), [#13355](https://github.com/can1357/oh-my-pi/pull/13355) by [@alphastorm](https://github.com/alphastorm))
 - Fixed a one-shot command that stopped before completing (for example `omp config set` on a fresh Windows profile) exiting 0 with no output; it now exits 1 with a stderr line naming the command and pointing at `PI_DEBUG_STARTUP` ([#13373](https://github.com/can1357/oh-my-pi/pull/13373) by [@alphastorm](https://github.com/alphastorm))
+- Fixed browser helper options with nested regular expressions (JavaScript `{ until: { url: /done/ } }`, Python keyword arguments such as `matcher=re.compile(...)`) arriving in the tab as plain objects instead of RegExps
 
 ## [18.3.2] - 2026-09-25
 

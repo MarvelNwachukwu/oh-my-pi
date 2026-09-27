@@ -201,6 +201,7 @@ import {
 	resolveFrame,
 } from "./frames";
 import { pushState, reloadPage, traverseHistory, type NavigationWaitUntil } from "./navigation";
+import { type HandoffOptions, type HandoffResult, parseHandoffOptions, waitForHandoff } from "./handoff";
 
 import { cloneSafe, RunOutput } from "./run-output";
 import type {
@@ -210,6 +211,7 @@ import type {
 	RunErrorPayload,
 	ScreenshotResult,
 	SessionSnapshot,
+	TabHandoffEvent,
 	ToolReply,
 	Transport,
 	WorkerInbound,
@@ -328,6 +330,8 @@ const ZERO_MATCH_POLL_MS = 250;
 const REQUEST_INTERCEPTION_CLEANUP_TIMEOUT_MS = 500;
 /** Bound cleanup window after a timed-out raw handle action. */
 const HANDLE_ACTION_INVALIDATION_TIMEOUT_MS = 500;
+/** Bound for raising the tab/window before a handoff; focusing is best-effort. */
+const HANDOFF_FOCUS_TIMEOUT_MS = 2_000;
 
 export interface OpTimeouts {
 	/** Largest per-op deadline allowed — strictly below the cell budget. */
@@ -414,6 +418,7 @@ interface TabApi {
 	select(selector: string, ...values: string[]): Promise<string[]>;
 	uploadFile(selector: string, ...filePaths: string[]): Promise<void>;
 	waitForUrl(pattern: string | RegExp, opts?: { timeout?: number }): Promise<string>;
+	handoff(opts: HandoffOptions): Promise<HandoffResult>;
 	waitForResponse(
 		pattern: string | RegExp | ((response: HTTPResponse) => boolean | Promise<boolean>),
 		opts?: { timeout?: number },
@@ -2134,6 +2139,17 @@ export class WorkerCore {
 				const w = waitMs(opts?.timeout);
 				return op("tab.waitForUrl()", w, sig => this.#waitForUrl(pattern, w, sig));
 			},
+			handoff: raw =>
+				op("tab.handoff()", INF, sig => {
+					const opts = parseHandoffOptions(raw);
+					if (!session.canHandoff) {
+						throw new ToolError(
+							"tab.handoff() needs an interactive omp session: no user would see the request. Call it as a direct tab helper from Eval in the interactive UI.",
+						);
+					}
+					const w = opts.timeout === undefined ? budgetBound : waitMs(opts.timeout);
+					return this.#handoff(active, name, opts, w, sig);
+				}),
 			waitForResponse: (pattern, opts) => {
 				const w = waitMs(opts?.timeout);
 				return op("tab.waitForResponse()", w, sig => this.#waitForResponse(pattern, w, sig));
@@ -2872,6 +2888,62 @@ export class WorkerCore {
 			),
 		);
 		return page.url();
+	}
+
+	/**
+	 * Hand the tab to the user: focus it, announce the request to the host UI,
+	 * then wait read-only for a completion signal. The agent never touches the
+	 * page meanwhile, so CAPTCHAs and logins stay the human's.
+	 */
+	async #handoff(
+		active: ActiveRun,
+		name: string,
+		opts: HandoffOptions,
+		timeoutMs: number,
+		signal: AbortSignal,
+	): Promise<HandoffResult> {
+		const page = this.#requirePage();
+		await this.#focusTab(page, signal);
+		const notice = (state: TabHandoffEvent["state"]): void =>
+			this.#transport.send({
+				type: "handoff",
+				runId: active.id,
+				event: { state, tab: name, message: opts.message, url: redactUrlCredentials(page.url()) },
+			});
+		notice("waiting");
+		try {
+			return await waitForHandoff(page, opts.until, { timeoutMs, signal, normalizeSelector });
+		} finally {
+			notice("done");
+		}
+	}
+
+	/**
+	 * Best-effort: raise the tab and its window. `Target.activateTarget` is what
+	 * the relay maps to focusing the user's Chrome window + tab; plain CDP
+	 * browsers honor it too. `Page.bringToFront` is the fallback. Never fails the
+	 * handoff — the host notification still tells the user where to look.
+	 */
+	async #focusTab(page: Page, signal: AbortSignal): Promise<void> {
+		const bounded = AbortSignal.any([signal, AbortSignal.timeout(HANDOFF_FOCUS_TIMEOUT_MS)]);
+		try {
+			const targetId = this.#targetId ?? (await untilAborted(bounded, () => targetIdForPage(page)));
+			const session = await untilAborted(bounded, () => page.createCDPSession());
+			try {
+				const connection = session.connection();
+				if (!connection) throw new Error("CDP connection unavailable");
+				await untilAborted(bounded, () => connection.send("Target.activateTarget", { targetId }));
+				return;
+			} finally {
+				void session.detach().catch(() => undefined);
+			}
+		} catch (error) {
+			signal.throwIfAborted();
+			this.#log("debug", "Target.activateTarget failed; falling back to Page.bringToFront", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		await untilAborted(bounded, () => page.bringToFront()).catch(() => signal.throwIfAborted());
 	}
 
 	async #waitForResponse(

@@ -33,6 +33,7 @@ import type {
 	RunResultOk,
 	SessionSnapshot,
 	Transferable,
+	TabHandoffEvent,
 	Transport,
 	WorkerInbound,
 	WorkerInitPayload,
@@ -70,6 +71,8 @@ export interface PendingRun {
 	 * cancellation into the still-running `runCmuxCode` body (issue #4499).
 	 */
 	closeAc?: AbortController;
+	/** Host UI sink for `tab.handoff()` notices from this run. */
+	onHandoff?: (event: TabHandoffEvent) => void;
 }
 
 interface TabSessionBase<TBrowser extends BrowserHandle = BrowserHandle> {
@@ -174,6 +177,11 @@ export interface RunInTabOptions {
 	timeoutMs: number;
 	signal?: AbortSignal;
 	session: ToolSession;
+	/**
+	 * Surfaces `tab.handoff()` requests to the user. Omit when nobody can see
+	 * them: the worker then fails `tab.handoff()` fast instead of waiting unseen.
+	 */
+	onHandoff?: (event: TabHandoffEvent) => void;
 }
 
 export interface ReleaseTabOptions {
@@ -599,18 +607,31 @@ async function acquireCmuxTab(
 export async function runInTab(name: string, opts: RunInTabOptions): Promise<RunResultOk> {
 	return await runInTabWithSnapshot(
 		name,
-		{ code: opts.code, timeoutMs: opts.timeoutMs, signal: opts.signal, session: opts.session },
+		{
+			code: opts.code,
+			timeoutMs: opts.timeoutMs,
+			signal: opts.signal,
+			session: opts.session,
+			onHandoff: opts.onHandoff,
+		},
 		{
 			cwd: opts.session.cwd,
 			browserScreenshotDir: expandBrowserScreenshotDir(opts.session),
 			excludeWebP: webpExclusionForModel(opts.session.getActiveModel?.()),
+			canHandoff: opts.onHandoff !== undefined,
 		},
 	);
 }
 
 async function runInTabWithSnapshot(
 	name: string,
-	opts: { code: string; timeoutMs: number; signal?: AbortSignal; session?: ToolSession },
+	opts: {
+		code: string;
+		timeoutMs: number;
+		signal?: AbortSignal;
+		session?: ToolSession;
+		onHandoff?: (event: TabHandoffEvent) => void;
+	},
 	snapshot: SessionSnapshot,
 ): Promise<RunResultOk> {
 	const tab = tabs.get(name);
@@ -654,6 +675,7 @@ async function runInTabWithSnapshot(
 		signal: opts.signal,
 		toolCalls: new Map(),
 		closeAc,
+		onHandoff: opts.onHandoff,
 	};
 	// Register BEFORE the unfreeze await below. Settle-freeze guards on
 	// `pending` (and undoes a transition already in flight when it observes
@@ -1334,6 +1356,17 @@ function handleTabMessage(tab: WorkerTabSession, msg: WorkerOutbound): void {
 	}
 	if (msg.type === "tool-call") {
 		void dispatchToolCall(tab, msg);
+		return;
+	}
+	if (msg.type === "handoff") {
+		const onHandoff = tab.pending.get(msg.runId)?.onHandoff;
+		try {
+			onHandoff?.(msg.event);
+		} catch (error) {
+			logger.warn("Browser handoff notice failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 		return;
 	}
 	if (msg.type === "log") logWorkerMessage(msg);

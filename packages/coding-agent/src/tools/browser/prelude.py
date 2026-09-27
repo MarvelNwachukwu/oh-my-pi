@@ -18,6 +18,11 @@ def _make_browser():
             if value.flags & re.DOTALL:
                 flags += "s"
             return {"__omp_re": {"source": value.pattern, "flags": flags}}
+        # Patterns may sit inside option dicts, e.g. until={"url": re.compile(...)}.
+        if isinstance(value, dict):
+            return {key: _encode_arg(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_encode_arg(item) for item in value]
         return value
 
     def _arguments(args, kwargs):
@@ -370,6 +375,9 @@ def _make_browser():
 
         async def waitForUrl(self, *args, **kwargs):
             return await self._method("waitForUrl", args, kwargs)
+
+        async def handoff(self, *args, **kwargs):
+            return await self._method("handoff", args, kwargs)
 
         async def evaluate(self, *args, **kwargs):
             return await self._method("evaluate", args, kwargs)

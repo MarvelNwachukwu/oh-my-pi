@@ -40,6 +40,16 @@ export interface SessionSnapshot {
 	browserScreenshotDir?: string;
 	/** Force non-WebP screenshot encoding (e.g. for Ollama). Unset honors `OMP_NO_WEBP`. */
 	excludeWebP?: boolean;
+	/** Host surfaces `tab.handoff()` requests to a user; without it the helper fails fast instead of waiting unseen. */
+	canHandoff?: boolean;
+}
+
+/** Worker → host lifecycle notice for `tab.handoff()`; the host surfaces it in its UI. */
+export interface TabHandoffEvent {
+	state: "waiting" | "done";
+	tab: string;
+	message: string;
+	url: string;
 }
 
 export type WorkerInitPayload =
@@ -155,6 +165,7 @@ export type WorkerOutbound =
 	| { type: "result"; id: string; ok: true; payload: RunResultOk }
 	| { type: "result"; id: string; ok: false; error: RunErrorPayload }
 	| { type: "tool-call"; id: string; runId: string; name: string; args: unknown }
+	| { type: "handoff"; runId: string; event: TabHandoffEvent }
 	| { type: "log"; level: "debug" | "warn" | "error"; msg: string; meta?: Record<string, unknown> }
 	| { type: "closed" };
 

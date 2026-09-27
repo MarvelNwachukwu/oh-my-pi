@@ -1294,6 +1294,11 @@ export class CmuxTab {
 		throw new ToolError(`tab.waitForUrl() timed out after ${timeoutMs}ms`);
 	}
 
+	/** Handoff relies on CDP tab focus and the tab worker's host notices; cmux drives surfaces over its socket. */
+	async handoff(_opts: unknown): Promise<never> {
+		throw new ToolError("tab.handoff() is not supported on the cmux backend");
+	}
+
 	/** Init scripts require CDP document-start registration. */
 	async addInitScript(_source: string): Promise<{ id: string }> {
 		throw new ToolError("tab.addInitScript() is not supported on the cmux backend");

@@ -26,7 +26,25 @@ function hasSoleOwnKey(value: Record<string, unknown>, key: string): boolean {
 	return keys.length === 1 && keys[0] === key;
 }
 
-/** Renders one host value as a JavaScript argument for an evaluated run. */
+/** `new RegExp(…)` source for a {@link RegExpArgMarker}; undefined for anything else. */
+function renderRegExpMarker(value: unknown): string | undefined {
+	if (!isPlainObject(value) || !hasSoleOwnKey(value, "__omp_re")) return undefined;
+	const marker = value.__omp_re;
+	if (
+		!isPlainObject(marker) ||
+		typeof marker.source !== "string" ||
+		(marker.flags !== undefined && typeof marker.flags !== "string")
+	) {
+		return undefined;
+	}
+	return `new RegExp(${JSON.stringify(marker.source)}, ${JSON.stringify(marker.flags ?? "")})`;
+}
+
+/**
+ * Renders one host value as a JavaScript argument for an evaluated run.
+ * A top-level function marker renders as code; RegExp markers render as
+ * `new RegExp(…)` at any depth (option objects such as `{ until: { url: /x/ } }`).
+ */
 export function renderRunArg(value: unknown): string {
 	if (value === undefined) return "undefined";
 
@@ -34,25 +52,31 @@ export function renderRunArg(value: unknown): string {
 		return `(${value.__omp_fn})`;
 	}
 
-	if (isPlainObject(value) && hasSoleOwnKey(value, "__omp_re")) {
-		const marker = value.__omp_re;
-		if (
-			isPlainObject(marker) &&
-			typeof marker.source === "string" &&
-			(marker.flags === undefined || typeof marker.flags === "string")
-		) {
-			return `new RegExp(${JSON.stringify(marker.source)}, ${JSON.stringify(marker.flags ?? "")})`;
-		}
-	}
+	const topLevel = renderRegExpMarker(value);
+	if (topLevel !== undefined) return topLevel;
 
+	// Nested markers become unguessable placeholder strings, swapped for code after
+	// serialization, so everything else keeps exact JSON.stringify semantics.
+	let placeholder: string | undefined;
+	const nested: string[] = [];
 	let rendered: string | undefined;
 	try {
-		rendered = JSON.stringify(value);
+		rendered = JSON.stringify(value, (_key, item: unknown) => {
+			const regexp = renderRegExpMarker(item);
+			if (regexp === undefined) return item;
+			placeholder ??= `__omp_re_${crypto.randomUUID()}_`;
+			nested.push(regexp);
+			return `${placeholder}${nested.length - 1}`;
+		});
 	} catch {
 		throw new ToolError(NON_SERIALIZABLE_RUN_ARGUMENT);
 	}
 	if (rendered === undefined) throw new ToolError(NON_SERIALIZABLE_RUN_ARGUMENT);
-	return rendered;
+	if (placeholder === undefined) return rendered;
+	return rendered.replace(
+		new RegExp(`"${placeholder}(\\d+)"`, "g"),
+		(_match, index: string) => nested[Number(index)]!,
+	);
 }
 
 /** Renders a helper call chain (`id(5).click()`) with arguments as JavaScript literals. */
