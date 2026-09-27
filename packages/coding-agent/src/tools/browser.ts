@@ -333,6 +333,9 @@ async function openBrowser(
 	const deadlineStart = performance.now();
 	const timeoutSignal = AbortSignal.timeout(timeoutMs);
 	const openSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+	// Set once tab acquisition starts: a timeout past this point leaves the
+	// acquisition running under late adoption, which the error must say.
+	let acquiringTab = false;
 	try {
 		const browser = await untilAborted(openSignal, () =>
 			acquireBrowser(kind, {
@@ -373,6 +376,7 @@ async function openBrowser(
 			) {
 				await untilAborted(openSignal, () => releaseTab(name, { kill: false, timeoutMs }));
 			}
+			acquiringTab = true;
 			result = await untilAborted(openSignal, () =>
 				acquireTab(name, browser, {
 					url: params.url,
@@ -394,6 +398,10 @@ async function openBrowser(
 					userAgent: params.user_agent,
 					ignoreHttpsErrors: params.ignore_https_errors,
 					signal: openSignal,
+					// A timed-out open keeps initializing and publishes its tab under
+					// `name`: the page it navigated is already on screen (in relay/CDP
+					// mode, in the user's own browser) and must not be orphaned.
+					lateAdoption: { cancelSignal: signal },
 					ownerSessionId: session.getSessionId?.() ?? undefined,
 					// Omitted stays undefined: creation defaults it to false
 					// while reuse by the owner leaves a set value alone.
@@ -431,7 +439,13 @@ async function openBrowser(
 		// Caller cancellation stays a ToolAbortError; the requested timeout
 		// becomes a timeout ToolError; anything else passes through unchanged.
 		if (signal?.aborted) throw error instanceof ToolAbortError ? error : new ToolAbortError();
-		if (timeoutSignal.aborted) throw new ToolError(`Browser open timed out after ${timeoutMs}ms`);
+		if (timeoutSignal.aborted) {
+			const pending =
+				acquiringTab && getTab(name) === undefined
+					? `; tab ${JSON.stringify(name)} keeps loading and is registered under that name once ready. Reopen with the same name to reuse it instead of opening another tab`
+					: "";
+			throw new ToolError(`Browser open timed out after ${timeoutMs}ms${pending}`);
+		}
 		throw error;
 	}
 }

@@ -162,6 +162,18 @@ export interface AcquireTabOptions {
 	 * extend another session's tab lifetime.
 	 */
 	persist?: boolean;
+	/**
+	 * Publish a tab whose initialization outlives the caller's deadline instead
+	 * of discarding it. `signal` fires on that deadline and on cancellation
+	 * alike; `cancelSignal` is the cancellation alone. When `signal` fires but
+	 * `cancelSignal` has not, initialization continues for up to another
+	 * `timeoutMs` and the ready tab is registered under `name`, so the page the
+	 * user already sees loading is not orphaned and a reopen of the same name
+	 * (queued behind this acquisition) reuses it. Cancellation, a release of
+	 * the name (or of its owner's or all tabs) before publication, an init
+	 * failure, or the extended budget running out still tear it down.
+	 */
+	lateAdoption?: { cancelSignal?: AbortSignal };
 }
 
 export interface AcquireTabResult {
@@ -192,6 +204,11 @@ const workerPageTargets = new WeakMap<WorkerHandle, string>();
 // same tab name so the existence check and `tabs.set` (separated by several
 // awaits) cannot interleave and leak a worker + browser refCount.
 const acquireChains = new Map<string, Promise<void>>();
+// Acquisitions opted into late adoption, by tab name (the chain above allows one
+// per name at a time). A close issued before a timed-out open has published its
+// tab (of that name, of the owner's tabs, or of every tab) flags the entry, and
+// the tab is then discarded instead of outliving the release.
+const lateAdoptions = new Map<string, { ownerSessionId?: string; released: boolean }>();
 const GRACE_MS = 750;
 // Cold-start guard for the worker's `setup` handshake (realm usable: puppeteer
 // loaded, browser connected, page acquired). On hosts where the worker's cold
@@ -281,7 +298,14 @@ export function acquireTab(name: string, browser: BrowserHandle, opts: AcquireTa
 	// run through a disconnected handle and leave the worker's page behind.
 	holdBrowser(browser);
 	const prior = acquireChains.get(name) ?? Promise.resolve();
-	const acquisition = prior.then(() => acquireTabImpl(name, browser, opts));
+	const acquisition = prior.then(() => {
+		if (!opts.lateAdoption) return acquireTabImpl(name, browser, opts);
+		const pending = { ownerSessionId: opts.ownerSessionId, released: false };
+		lateAdoptions.set(name, pending);
+		return acquireTabImpl(name, browser, opts).finally(() => {
+			if (lateAdoptions.get(name) === pending) lateAdoptions.delete(name);
+		});
+	});
 	const result = acquisition.then(
 		async value => {
 			await releaseBrowser(browser, { kill: false });
@@ -376,8 +400,13 @@ async function acquireTabImpl(
 					);
 				}
 				if (opts.url) {
+					// Reopening a name re-attaches to its tab: navigate only when the
+					// tab is elsewhere, so retrying an open (e.g. after it timed out)
+					// does not reload a page the user may already be filling in. The
+					// WHATWG-serialized form is what `page.url()` reports.
+					const sameUrl = URL.canParse(opts.url) ? new URL(opts.url).href : opts.url;
 					reuseSteps.push(
-						`await tab.goto(${JSON.stringify(opts.url)}, { waitUntil: ${JSON.stringify(opts.waitUntil ?? "load")} });`,
+						`if (tab.url() !== ${JSON.stringify(sameUrl)}) await tab.goto(${JSON.stringify(opts.url)}, { waitUntil: ${JSON.stringify(opts.waitUntil ?? "load")} });`,
 					);
 				}
 				if (reuseSteps.length) {
@@ -428,8 +457,12 @@ async function acquireTabImpl(
 	// worker (and its orphaned page on a shared browser) alive long after the
 	// caller gave up; the phase floors inside initializeTabWorker keep each
 	// phase positive for sub-second budgets, and the caller's abort signal is
-	// the hard backstop for floor overshoot.
-	const initBudgetMs = opts.timeoutMs + GRACE_MS;
+	// the hard backstop for floor overshoot. Late adoption adds one more
+	// `timeoutMs`: the worker's first navigation is itself bounded by
+	// `timeoutMs` but starts after the caller's clock, so an open whose page
+	// loads (or stalls) past the caller's deadline still reports ready within
+	// the extension and can be published.
+	const initBudgetMs = opts.timeoutMs + GRACE_MS + (opts.lateAdoption ? opts.timeoutMs : 0);
 	let info: ReadyInfo;
 	try {
 		info = await initializeTabWorker(worker, initPayload, initBudgetMs, startedAt);
@@ -471,18 +504,22 @@ async function acquireTabImpl(
 		}
 	}
 
-	// If the caller aborted while we were spawning/initializing the worker, tear
-	// the freshly-built worker down before publishing the tab so the browser
-	// refCount (which `holdBrowser` below would take) never grows for a tab
-	// nobody is waiting for. Mirror the error paths' `refCount === 0` release so
-	// a fresh browser held by nothing but this aborted open is not orphaned in
+	// If the caller abandoned the open while we were spawning/initializing the
+	// worker, tear the freshly-built worker down before publishing the tab so the
+	// browser refCount (which `holdBrowser` below would take) never grows for a
+	// tab nobody is waiting for. Mirror the error paths' `refCount === 0` release
+	// so a fresh browser held by nothing but this aborted open is not orphaned in
 	// the registry; a browser still leased/held elsewhere (refCount > 0) is left
-	// for its owner to release.
-	if (opts.signal?.aborted) {
+	// for its owner to release. A caller that only ran out of time under late
+	// adoption falls through: the tab is published for its next reopen.
+	if (openAbandoned(name, opts)) {
 		await worker.terminate().catch(() => undefined);
 		closeAbandonedWorkerPage(browser, worker);
 		if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false }).catch(() => undefined);
 		throw new ToolAbortError("Browser tab open aborted");
+	}
+	if (opts.signal?.aborted) {
+		logger.debug("Publishing browser tab whose open timed out", { name, url: info.url });
 	}
 
 	holdBrowser(browser);
@@ -562,9 +599,9 @@ async function acquireCmuxTab(
 			await cmuxTab.goto(opts.url, { waitUntil: opts.waitUntil ?? "load", timeoutMs: opts.timeoutMs });
 		}
 		const info = await cmuxTab.readyInfo(opts.viewport ?? DEFAULT_VIEWPORT);
-		// If the caller aborted while we were opening the cmux surface, close the
-		// surface (if we own it) instead of taking a browser hold on it.
-		if (opts.signal?.aborted) {
+		// If the caller abandoned the open while we were opening the cmux surface,
+		// close the surface (if we own it) instead of taking a browser hold on it.
+		if (openAbandoned(name, opts)) {
 			throw new ToolAbortError("Browser tab open aborted");
 		}
 		holdBrowser(browser);
@@ -780,6 +817,9 @@ const releaseInflight = new WeakMap<TabSession, { promise: Promise<boolean>; opt
 export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Promise<boolean> {
 	const tab = tabs.get(name);
 	if (!tab) {
+		// A timed-out open of this name may still be initializing; the close wins.
+		const pending = lateAdoptions.get(name);
+		if (pending) pending.released = true;
 		logger.debug("releaseTab: unknown tab", { name });
 		return false;
 	}
@@ -924,6 +964,7 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 }
 
 export async function releaseAllTabs(opts: ReleaseTabOptions = {}): Promise<number> {
+	for (const pending of lateAdoptions.values()) pending.released = true;
 	const names = [...tabs.keys()];
 	let count = 0;
 	for (const name of names) {
@@ -952,6 +993,9 @@ export async function dropHeadlessTabs(): Promise<void> {
  */
 export async function releaseTabsForOwner(ownerId: string, opts: ReleaseTabOptions = {}): Promise<number> {
 	if (!ownerId) return 0;
+	for (const pending of lateAdoptions.values()) {
+		if (pending.ownerSessionId === ownerId) pending.released = true;
+	}
 	const names = [...tabs.values()].filter(tab => tab.ownerSessionId === ownerId).map(tab => tab.name);
 	let count = 0;
 	for (const name of names) {
@@ -1262,6 +1306,20 @@ function isLastSurfaceCloseError(err: unknown): boolean {
 function sameAllowedDomains(left: readonly string[], right: readonly string[] | undefined): boolean {
 	if (!right || left.length !== right.length) return false;
 	return left.every((domain, index) => domain === right[index]);
+}
+
+/**
+ * Whether nobody will take an acquisition's result: its caller stopped
+ * waiting, and either late adoption does not cover the stop (not opted in, or
+ * cancelled) or a release has claimed the name since.
+ */
+function openAbandoned(name: string, opts: AcquireTabOptions): boolean {
+	if (!opts.signal?.aborted) return false;
+	return (
+		opts.lateAdoption === undefined ||
+		opts.lateAdoption.cancelSignal?.aborted === true ||
+		lateAdoptions.get(name)?.released === true
+	);
 }
 
 async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTabOptions): Promise<WorkerInitPayload> {

@@ -1410,11 +1410,22 @@ export class WorkerCore {
 			this.#network = new BrowserNetworkManager(this.#page, payload.allowedDomains);
 			await this.#network.start();
 			if (payload.url) {
-				await this.#page.goto(payload.url, {
-					// Default to "load" because dev servers with HMR/WS never reach networkidle.
-					waitUntil: payload.waitUntil ?? "load",
-					timeout: payload.timeoutMs,
-				});
+				try {
+					await this.#page.goto(payload.url, {
+						// Default to "load" because dev servers with HMR/WS never reach networkidle.
+						waitUntil: payload.waitUntil ?? "load",
+						timeout: payload.timeoutMs,
+					});
+				} catch (error) {
+					// Both this timeout and the open's deadline are `timeoutMs`, but
+					// this one starts later, so it expires after the caller stopped
+					// waiting; only a supervisor adopting the tab late still wants it.
+					// The page exists and navigated as far as it could: stop the stalled
+					// load, as a timed-out `tab.goto` does, and report ready so the tab
+					// is registered, not discarded.
+					if (!(error instanceof Error && error.name === "TimeoutError")) throw error;
+					await this.#stopLoading();
+				}
 			}
 			this.#targetId = await targetIdForPage(this.#page);
 			this.#transport.send({ type: "ready", info: await this.#currentReadyInfo() });
