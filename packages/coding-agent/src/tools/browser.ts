@@ -94,6 +94,7 @@ const appSchema = type({
 	"relay?": type("boolean").describe("drive the user's own tabs via the omp browser relay"),
 	"args?": type("string[]").describe("extra cli args"),
 	"target?": type("string").describe("substring to pick a window"),
+	"adopt?": type("'visible'").describe("relay: drive the visible tab even when url is set"),
 });
 
 const tabCallStepSchema = type({
@@ -385,6 +386,7 @@ async function openBrowser(
 							}
 						: undefined,
 					target: params.app?.target,
+					adopt: params.app?.adopt,
 					timeoutMs,
 					deadlineStartMs: deadlineStart,
 					dialogs: params.dialogs,

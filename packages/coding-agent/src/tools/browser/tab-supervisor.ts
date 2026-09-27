@@ -127,6 +127,12 @@ export interface AcquireTabOptions {
 	waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2";
 	viewport?: { width: number; height: number; deviceScaleFactor?: number };
 	target?: string;
+	/**
+	 * Relay only: `"visible"` adopts the foreground tab even when `url` is set.
+	 * Without it, a relay open with a `url` and no `target` creates a new tab so
+	 * the user's (or a sibling agent's) visible tab is never navigated away.
+	 */
+	adopt?: "visible";
 	signal?: AbortSignal;
 	timeoutMs: number;
 	/**
@@ -413,11 +419,13 @@ async function acquireTabImpl(
 		}
 	}
 	let initPayload: WorkerInitPayload;
+	let createdPage: Page | undefined;
 	let worker: WorkerHandle;
 	try {
-		initPayload = await buildInitPayload(browser, opts);
+		({ payload: initPayload, createdPage } = await buildInitPayload(browser, opts));
 		worker = await spawnTabWorker();
 	} catch (error) {
+		await discardCreatedPage(createdPage);
 		// Failing before the worker took its own hold must release the
 		// temporary one, or the browser's refCount never reaches 0 again.
 		if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
@@ -432,57 +440,64 @@ async function acquireTabImpl(
 	const initBudgetMs = opts.timeoutMs + GRACE_MS;
 	let info: ReadyInfo;
 	try {
-		info = await initializeTabWorker(worker, initPayload, initBudgetMs, startedAt);
-	} catch (error) {
-		// `BuildMessage`-class failures arrive asynchronously via the worker's `error` event,
-		// after `spawnTabWorker`'s synchronous try/catch has already returned. Fall back to
-		// the inline worker here so module-resolution failures don't poison every tab open.
-		await worker.terminate().catch(() => undefined);
-		// A headless worker that died mid-init may have already created its page in the
-		// shared browser — a killed worker can't close it, so close the target the worker
-		// reported (no-op when it never got that far).
-		closeAbandonedWorkerPage(browser, worker);
-		if (worker.mode === "inline" || isReportedInitFailure(error)) {
-			if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
-			throw error;
-		}
-		// Fail fast once the caller's init budget is exhausted: its timeout has already
-		// fired, so a retried result would only be discarded by the post-init abort check —
-		// don't spend the phase floors' excess on a cold start nobody is waiting for.
-		if (initBudgetExhausted(initBudgetMs, startedAt)) {
-			if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
-			throw error;
-		}
-		logger.warn("Tab worker init failed; retrying with inline tab worker (no sync-loop guard)", {
-			error: error instanceof Error ? error.message : String(error),
-		});
-		worker = await spawnInlineWorker();
 		try {
 			info = await initializeTabWorker(worker, initPayload, initBudgetMs, startedAt);
-		} catch (inlineError) {
+		} catch (error) {
+			// `BuildMessage`-class failures arrive asynchronously via the worker's `error` event,
+			// after `spawnTabWorker`'s synchronous try/catch has already returned. Fall back to
+			// the inline worker here so module-resolution failures don't poison every tab open.
+			await worker.terminate().catch(() => undefined);
+			// A headless worker that died mid-init may have already created its page in the
+			// shared browser — a killed worker can't close it, so close the target the worker
+			// reported (no-op when it never got that far).
+			closeAbandonedWorkerPage(browser, worker);
+			if (worker.mode === "inline" || isReportedInitFailure(error)) {
+				if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
+				throw error;
+			}
+			// Fail fast once the caller's init budget is exhausted: its timeout has already
+			// fired, so a retried result would only be discarded by the post-init abort check —
+			// don't spend the phase floors' excess on a cold start nobody is waiting for.
+			if (initBudgetExhausted(initBudgetMs, startedAt)) {
+				if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
+				throw error;
+			}
+			logger.warn("Tab worker init failed; retrying with inline tab worker (no sync-loop guard)", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			worker = await spawnInlineWorker();
+			try {
+				info = await initializeTabWorker(worker, initPayload, initBudgetMs, startedAt);
+			} catch (inlineError) {
+				await worker.terminate().catch(() => undefined);
+				closeAbandonedWorkerPage(browser, worker);
+				if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
+				const finalError = new ToolError(
+					`Failed to start browser tab worker (inline fallback also failed): ${inlineError instanceof Error ? inlineError.message : String(inlineError)}`,
+				);
+				(finalError as { cause?: unknown }).cause = error;
+				throw finalError;
+			}
+		}
+
+		// If the caller aborted while we were spawning/initializing the worker, tear
+		// the freshly-built worker down before publishing the tab so the browser
+		// refCount (which `holdBrowser` below would take) never grows for a tab
+		// nobody is waiting for. Mirror the error paths' `refCount === 0` release so
+		// a fresh browser held by nothing but this aborted open is not orphaned in
+		// the registry; a browser still leased/held elsewhere (refCount > 0) is left
+		// for its owner to release.
+		if (opts.signal?.aborted) {
 			await worker.terminate().catch(() => undefined);
 			closeAbandonedWorkerPage(browser, worker);
-			if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
-			const finalError = new ToolError(
-				`Failed to start browser tab worker (inline fallback also failed): ${inlineError instanceof Error ? inlineError.message : String(inlineError)}`,
-			);
-			(finalError as { cause?: unknown }).cause = error;
-			throw finalError;
+			if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false }).catch(() => undefined);
+			throw new ToolAbortError("Browser tab open aborted");
 		}
-	}
-
-	// If the caller aborted while we were spawning/initializing the worker, tear
-	// the freshly-built worker down before publishing the tab so the browser
-	// refCount (which `holdBrowser` below would take) never grows for a tab
-	// nobody is waiting for. Mirror the error paths' `refCount === 0` release so
-	// a fresh browser held by nothing but this aborted open is not orphaned in
-	// the registry; a browser still leased/held elsewhere (refCount > 0) is left
-	// for its owner to release.
-	if (opts.signal?.aborted) {
-		await worker.terminate().catch(() => undefined);
-		closeAbandonedWorkerPage(browser, worker);
-		if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false }).catch(() => undefined);
-		throw new ToolAbortError("Browser tab open aborted");
+	} catch (error) {
+		// A relay tab created for this open belongs to nobody once the open
+		// fails; `acquireTab`'s own hold keeps the connection alive for the close.
+		await discardCreatedPage(createdPage);
+		throw error;
 	}
 
 	holdBrowser(browser);
@@ -1264,12 +1279,18 @@ function sameAllowedDomains(left: readonly string[], right: readonly string[] | 
 	return left.every((domain, index) => domain === right[index]);
 }
 
-async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTabOptions): Promise<WorkerInitPayload> {
+/** Worker init payload plus the relay tab created for it, which a failed open must close. */
+interface InitPlan {
+	payload: WorkerInitPayload;
+	createdPage?: Page;
+}
+
+async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTabOptions): Promise<InitPlan> {
 	const safeDir = getPuppeteerDir();
 	const browserWSEndpoint = browser.browser.wsEndpoint();
 	if (!browserWSEndpoint) throw new ToolError("Browser websocket endpoint is unavailable");
 	if (browser.kind.kind === "headless") {
-		return {
+		const payload: WorkerInitPayload = {
 			mode: "headless",
 			browserWSEndpoint,
 			safeDir,
@@ -1287,33 +1308,61 @@ async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTa
 			waitUntil: opts.waitUntil,
 			timeoutMs: opts.timeoutMs,
 		};
+		return { payload };
 	}
-	// Connected and relay browsers are user-driven. When no target is requested,
-	// adopt the visible tab and avoid raising it before screenshots. An explicit
-	// target may be backgrounded, so retain activation for target-correct pixels.
+	// Relay drives the user's real Chrome, shared with the user and sibling
+	// agents. A url without a target asks to go somewhere, not to hijack the
+	// foreground tab: open a fresh tab for it. The visible tab is adopted only
+	// when nothing names a destination, or when the caller opts in explicitly.
+	const createTab = browser.kind.kind === "relay" && !!opts.url && !opts.target && opts.adopt !== "visible";
+	// Connected and relay browsers are user-driven. An adopted visible tab must
+	// not be raised before screenshots. An explicit target or a created tab may
+	// be backgrounded, so retain activation for target-correct pixels.
 	const userDriven = browser.kind.kind === "connected" || browser.kind.kind === "relay";
-	const activateForScreenshot = !userDriven || !shouldPreserveConnectedBrowserFocus(opts.target);
-	const page = await pickElectronTarget(browser.browser, {
-		matcher: opts.target,
-		preferVisible: !activateForScreenshot,
-	});
-	const targetId = await targetIdForPage(page);
+	const activateForScreenshot = createTab || !userDriven || !shouldPreserveConnectedBrowserFocus(opts.target);
+	// A created tab starts blank: the worker navigates only after installing init
+	// scripts, allowed_domains interception, and the other per-tab options.
+	const createdPage = createTab ? await browser.browser.newPage() : undefined;
+	const page =
+		createdPage ??
+		(await pickElectronTarget(browser.browser, {
+			matcher: opts.target,
+			preferVisible: !activateForScreenshot,
+		}));
+	let targetId: string;
+	try {
+		targetId = await targetIdForPage(page);
+	} catch (error) {
+		await discardCreatedPage(createdPage);
+		throw error;
+	}
 	return {
-		mode: "attach",
-		browserWSEndpoint,
-		safeDir,
-		targetId,
-		dialogs: opts.dialogs,
-		allowedDomains: opts.allowedDomains,
-		initScripts: opts.initScripts,
-		downloadsPath: opts.downloadsPath,
-		userAgent: opts.userAgent,
-		ignoreHttpsErrors: opts.ignoreHttpsErrors,
-		url: opts.url,
-		waitUntil: opts.waitUntil,
-		timeoutMs: opts.timeoutMs,
-		activateForScreenshot,
+		payload: {
+			mode: "attach",
+			browserWSEndpoint,
+			safeDir,
+			targetId,
+			dialogs: opts.dialogs,
+			allowedDomains: opts.allowedDomains,
+			initScripts: opts.initScripts,
+			downloadsPath: opts.downloadsPath,
+			userAgent: opts.userAgent,
+			ignoreHttpsErrors: opts.ignoreHttpsErrors,
+			url: opts.url,
+			waitUntil: opts.waitUntil,
+			timeoutMs: opts.timeoutMs,
+			activateForScreenshot,
+		},
+		createdPage,
 	};
+}
+
+/** Close a relay tab created for an open that failed; best-effort and bounded. */
+async function discardCreatedPage(page: Page | undefined): Promise<void> {
+	if (!page || page.isClosed()) return;
+	await withTimeout(page.close(), DEFAULT_TAB_CLOSE_TIMEOUT_MS, "Timed out closing abandoned relay tab").catch(
+		() => undefined,
+	);
 }
 
 function handleTabMessage(tab: WorkerTabSession, msg: WorkerOutbound): void {

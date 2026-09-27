@@ -78,7 +78,8 @@ Sources: [`packages/browser-relay/README.md`](../packages/browser-relay/README.m
   `browser.relay`, which makes the relay the profile-wide default across projects (scope
   details in the package README).
 - Behavior: the relay auto-starts through the global daemon broker; `app.target` selects a tab by
-  URL/title substring, otherwise the visible tab is adopted.
+  URL/title substring. Without a target, an open with `url` creates a new tab; with neither, the
+  visible tab is adopted (`app.adopt: "visible"` forces adoption when `url` is set).
 - Security/limits: it binds loopback; use `--token` when local processes are untrusted. Chrome
   internal pages, DevTools, Web Store, extension pages, and tabs with DevTools open cannot attach.
 

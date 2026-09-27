@@ -7,12 +7,14 @@ interface BrowserAppOptions {
 	path?: string;
 	/** HTTP Chrome DevTools Protocol discovery endpoint to attach to. */
 	cdp_url?: string;
-	/** Drive the user's existing Chrome tabs through the omp Browser Relay. */
+	/** Drive the user's Chrome through the omp Browser Relay. With `url` and no `target`, opens a new tab; with neither, adopts the visible tab. */
 	relay?: boolean;
 	/** Extra command-line arguments for a spawned executable. */
 	args?: string[];
 	/** URL/title substring used to select an attached tab. */
 	target?: string;
+	/** Relay only: `"visible"` drives the foreground tab even when `url` is set, instead of opening a new tab. */
+	adopt?: "visible";
 }
 
 /** Requested browser page viewport. */

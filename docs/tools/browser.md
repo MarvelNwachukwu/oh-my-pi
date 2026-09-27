@@ -103,7 +103,7 @@ Python `tab.run` accepts a JavaScript string only; it does not accept a Python c
 - **Headless:** creates an omp-owned page in project-shared Chromium and applies stealth patches.
 - **Spawned (`app.path`):** starts or reuses a CDP-enabled browser/Electron executable. `app.args` applies only here.
 - **Connected (`app.cdp_url`):** attaches to an existing HTTP CDP discovery endpoint.
-- **Relay (`app.relay: true`):** adopts the user's real Chrome tab. `app.target` selects by URL/title substring; without it the visible usable tab is adopted.
+- **Relay (`app.relay: true`):** drives the user's real Chrome. `app.target` selects a tab by URL/title substring. Without a target, opening with `url` creates and claims a new tab, leaving the visible tab untouched; with neither `url` nor `target`, the visible usable tab is adopted. `app.adopt: "visible"` adopts the visible tab even when `url` is set.
 - **Cmux:** drives an available cmux WKWebView surface.
 
 Reusing one tab name across browser kinds is rejected until the existing tab is closed. Closing omp-owned headless pages and owned cmux surfaces closes them. Connected and relay pages remain open. Spawned browser processes remain open unless `kill: true` releases their last managed tab and terminates the process.
@@ -116,7 +116,7 @@ Host result details preserve structured `value` separately from displayed conten
 
 ## Safety and lifecycle
 
-Relay and attached modes operate on real logged-in sessions; sites attribute actions to the user. Name a target or create a dedicated tab. Never navigate the user's visible tab or take a consequential action without direct authorization.
+Relay and attached modes operate on real logged-in sessions; sites attribute actions to the user. Name a target or open a dedicated tab with `url`. Never navigate the user's visible tab or take a consequential action without direct authorization.
 
 Each named tab has one worker and permits one active run. A timed-out or aborted run can recycle the worker and invalidate handles. `browser.close({ all: true })` releases all managed tabs; `kill` never closes or kills relay/CDP-attached browsers.
 

@@ -43,9 +43,9 @@ Application modes:
 - `headed` picks a visible or hidden managed browser per open. `allow_file_access` is a launch flag and cannot change an already-running shared Chromium; use a dedicated `app.path` with `app.args`. `ignore_https_errors` applies per tab through CDP.
 - `app.path`: launch the specified browser or Electron executable. Chromium-family browsers use an omp-owned profile unless `args` supplies `--user-data-dir`.
 - `app.cdp_url`: attach to an existing CDP endpoint.
-- `app.relay: true`: drive the user's Chrome through the omp relay. `app.target` selects a tab by URL/title substring; without it, the visible tab is adopted. Opening with `url` navigates that adopted tab.
-- Relay sessions are the user's real logged-in browser. Sites attribute actions to the user. Name a target or create a dedicated tab; NEVER navigate the visible tab without authorization.
-- Closing releases the managed tab. It never closes relay/CDP-attached pages. `kill: true` terminates only applications spawned by this process, never reused browser processes.
+- `app.relay: true`: drive the user's Chrome through the omp relay. `app.target` selects a tab by URL/title substring. Without a target, opening with `url` creates a new tab and claims it; the visible tab is untouched. With neither `url` nor `target`, the visible tab is adopted; `app.adopt: "visible"` also adopts it when `url` is set, navigating it.
+- Relay sessions are the user's real logged-in browser. Sites attribute actions to the user. Open your own tab with `url`; NEVER adopt or navigate the visible tab without authorization.
+- Closing releases the managed tab. It never closes relay/CDP-attached pages, including relay tabs opened with `url`. `kill: true` terminates only applications spawned by this process, never reused browser processes.
 - Idle tabs auto-freeze at turn settle (animated pages stop burning CPU/GPU) and unfreeze on next use; tabs idle past the idle-close timeout are closed. Pass `persist: true` on `open` to keep a tab live across turns (e.g. multi-step login); `browser.close` still releases explicitly.
  </instruction>
 
