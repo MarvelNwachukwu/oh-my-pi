@@ -227,4 +227,84 @@ return { body, seen };`,
 		) as Array<{ failureText?: string }>;
 		expect(blocked.some(request => request.failureText === "blocked by allowed_domains")).toBe(true);
 	});
+
+	// Raw interception is restored through the page prototype after the run's own
+	// `page` override is removed, so patching the prototype simulates a restore that
+	// fails on the CDP side (e.g. a relay session erroring) without affecting the run's calls.
+	const breakNextInterceptionRestore = `const proto = Object.getPrototypeOf(page);
+const original = proto.setRequestInterception;
+proto.setRequestInterception = async function () {
+  proto.setRequestInterception = original;
+  throw new Error("simulated restore failure");
+};`;
+	const rawInterception = `await page.setRequestInterception(true);
+page.on("request", request => {
+  if (!request.isInterceptResolutionHandled()) void request.continue();
+});`;
+	const fetchApi = `return await tab.evaluate(async url => await (await fetch(url)).json(), ${JSON.stringify(`${baseUrl}/api`)})`;
+
+	test("returns a successful run with a warning when interception restore fails", async () => {
+		const invoke = createHost();
+		await invoke({ action: "open", name: "restore-warn", url: `${baseUrl}/` });
+		const result = await invoke({
+			action: "run",
+			name: "restore-warn",
+			code: `${rawInterception}\n${breakNextInterceptionRestore}\nreturn "body-ok";`,
+		});
+		expect(valueOf(result)).toBe("body-ok");
+		const text = result.content.map(part => (part.type === "text" ? part.text : "")).join("\n");
+		expect(text).toContain("simulated restore failure");
+
+		// The run left raw interception enabled with its handler removed; the tab
+		// must be reset so later requests do not stall on an unhandled pause.
+		const after = await invoke({ action: "run", name: "restore-warn", code: fetchApi });
+		expect(valueOf(after)).toEqual({ source: "fixture" });
+	});
+
+	test("keeps the body error when interception restore also fails", async () => {
+		const invoke = createHost();
+		await invoke({ action: "open", name: "restore-body-error", url: `${baseUrl}/` });
+		// Capture the rejection rather than `expect(...).rejects`: with that form Bun
+		// never delivered this run's worker result and it hung past grace.
+		const failure = await invoke({
+			action: "run",
+			name: "restore-body-error",
+			code: `${rawInterception}\n${breakNextInterceptionRestore}\nthrow new Error("body failed");`,
+		}).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as Error).message).toBe("body failed");
+		const after = await invoke({ action: "run", name: "restore-body-error", code: fetchApi });
+		expect(valueOf(after)).toEqual({ source: "fixture" });
+	});
+
+	test("skips interception restore for runs that never touched interception", async () => {
+		const invoke = createHost();
+		await invoke({ action: "open", name: "restore-skip", url: `${baseUrl}/` });
+		await invoke({
+			action: "run",
+			name: "restore-skip",
+			code: `const proto = Object.getPrototypeOf(page);
+const original = proto.setRequestInterception;
+proto.__restoreSpy = { original, calls: 0 };
+proto.setRequestInterception = function (...args) {
+  proto.__restoreSpy.calls += 1;
+  return original.apply(this, args);
+};`,
+		});
+		const calls = valueOf(
+			await invoke({
+				action: "run",
+				name: "restore-skip",
+				code: `const proto = Object.getPrototypeOf(page);
+const { original, calls } = proto.__restoreSpy;
+proto.setRequestInterception = original;
+delete proto.__restoreSpy;
+return calls;`,
+			}),
+		);
+		expect(calls).toBe(0);
+	});
 });

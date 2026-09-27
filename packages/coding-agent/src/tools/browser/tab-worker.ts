@@ -208,6 +208,7 @@ import type {
 	ObservationEntry,
 	ReadyInfo,
 	RunErrorPayload,
+	RunResultOk,
 	ScreenshotResult,
 	SessionSnapshot,
 	ToolReply,
@@ -889,28 +890,36 @@ function redactUrlCredentials(url: string): string {
 	}
 }
 
-class RequestInterceptionCleanupError extends ToolError {}
-
 interface RunPageScope {
 	page: Page;
-	cleanup(): Promise<void>;
+	/**
+	 * Remove run-owned listeners and restore raw interception when the run changed it.
+	 * Returns a description of a failed interception restore instead of throwing: the
+	 * run's outcome stands, and the caller decides how to surface it and reset the tab.
+	 */
+	cleanup(): Promise<string | undefined>;
 }
 
 /**
  * Expose the tab page while retaining every event handler created by this run.
  * The facade removes only run-owned listeners, preserving worker-level routing,
  * request logging, dialogs, and console capture. Raw interception is restored
- * to the tab's persistent route/allowlist state after the run.
+ * to the tab's persistent route/allowlist state after a run that toggled it;
+ * runs that never called `setRequestInterception` skip the restore, which would
+ * otherwise send `Fetch.disable` to every CDP session of a fresh tab.
  */
 function createRunPageScope(page: Page, restoreInterception: () => Promise<void>): RunPageScope {
 	const handlers = new Map<unknown, unknown[]>();
 	const on = page.on;
 	const off = page.off;
 	const once = page.once;
+	const setRequestInterception = page.setRequestInterception;
 	const onDescriptor = Object.getOwnPropertyDescriptor(page, "on");
 	const offDescriptor = Object.getOwnPropertyDescriptor(page, "off");
 	const onceDescriptor = Object.getOwnPropertyDescriptor(page, "once");
 	const removeAllDescriptor = Object.getOwnPropertyDescriptor(page, "removeAllListeners");
+	const interceptionDescriptor = Object.getOwnPropertyDescriptor(page, "setRequestInterception");
+	let interceptionTouched = false;
 
 	const remember = (type: unknown, handler: unknown): void => {
 		const owned = handlers.get(type);
@@ -975,6 +984,13 @@ function createRunPageScope(page: Page, restoreInterception: () => Promise<void>
 				return page;
 			},
 		},
+		setRequestInterception: {
+			configurable: true,
+			value: (enabled: boolean): Promise<void> => {
+				interceptionTouched = true;
+				return Reflect.apply(setRequestInterception, page, [enabled]);
+			},
+		},
 	});
 
 	return {
@@ -988,30 +1004,28 @@ function createRunPageScope(page: Page, restoreInterception: () => Promise<void>
 			else Reflect.deleteProperty(page, "once");
 			if (removeAllDescriptor) Object.defineProperty(page, "removeAllListeners", removeAllDescriptor);
 			else Reflect.deleteProperty(page, "removeAllListeners");
+			if (interceptionDescriptor) Object.defineProperty(page, "setRequestInterception", interceptionDescriptor);
+			else Reflect.deleteProperty(page, "setRequestInterception");
 			for (const [type, owned] of handlers) {
 				for (const handler of owned) Reflect.apply(off, page, [type, handler]);
 			}
 			handlers.clear();
+			if (!interceptionTouched) return undefined;
 			try {
 				await withTimeout(
 					restoreInterception(),
 					REQUEST_INTERCEPTION_CLEANUP_TIMEOUT_MS,
 					"Timed out restoring browser request interception",
 				);
+				return undefined;
 			} catch (error) {
-				throw new RequestInterceptionCleanupError(
-					"Failed to restore browser request interception after browser.run",
-					{
-						error: error instanceof Error ? error.message : String(error),
-					},
-				);
+				return error instanceof Error ? error.message : String(error);
 			}
 		},
 	};
 }
 
 function errorPayload(error: unknown): RunErrorPayload {
-	const recoverTab = error instanceof RequestInterceptionCleanupError || undefined;
 	if (error instanceof ToolAbortError) {
 		return { name: error.name, message: error.message, stack: error.stack, isToolError: false, isAbort: true };
 	}
@@ -1022,7 +1036,6 @@ function errorPayload(error: unknown): RunErrorPayload {
 			stack: error.stack,
 			isToolError: true,
 			isAbort: false,
-			recoverTab,
 		};
 	}
 	if (error instanceof Error) {
@@ -1563,6 +1576,7 @@ export class WorkerCore {
 		let returnValue: unknown;
 		let failure: { error: unknown } | undefined;
 		let runPage: RunPageScope | undefined;
+		let cleanupFailure: string | undefined;
 		try {
 			throwIfAborted(signal);
 			await untilAborted(signal, () => this.#emulation?.reapply() ?? Promise.resolve());
@@ -1655,26 +1669,38 @@ export class WorkerCore {
 		} finally {
 			runAc.abort(postmortem.markExpectedCleanupError(new ToolAbortError("Browser run ended")));
 			await Bun.sleep(0);
-			try {
-				await runPage?.cleanup();
-			} catch (error) {
-				failure = { error };
-			}
+			cleanupFailure = await runPage?.cleanup();
 			failure = this.#foldFloatingRejections(active, failure);
 			if (this.#active?.id === msg.id) this.#active = null;
 		}
+		// A failed interception restore leaves the tab's network state unknown, so the
+		// supervisor resets the tab either way; it never replaces the run's own outcome.
+		if (cleanupFailure !== undefined) {
+			this.#log("warn", "Failed to restore browser request interception after browser.run", {
+				runId: msg.id,
+				error: cleanupFailure,
+			});
+		}
 		if (failure) {
-			this.#transport.send({ type: "result", id: msg.id, ok: false, error: errorPayload(failure.error) });
+			const error = errorPayload(failure.error);
+			if (cleanupFailure !== undefined) error.recoverTab = true;
+			this.#transport.send({ type: "result", id: msg.id, ok: false, error });
 			return;
 		}
 		if (completed) {
 			await this.#postReadyInfo();
-			this.#transport.send({
-				type: "result",
-				id: msg.id,
-				ok: true,
-				payload: { displays: output.finish(), returnValue: cloneSafe(returnValue), screenshots },
-			});
+			const payload: RunResultOk = {
+				displays: output.finish(),
+				returnValue: cloneSafe(returnValue),
+				screenshots,
+			};
+			if (cleanupFailure !== undefined) {
+				payload.warnings = [
+					`browser.run completed, but restoring request interception afterwards failed: ${cleanupFailure}`,
+				];
+				payload.recoverTab = true;
+			}
+			this.#transport.send({ type: "result", id: msg.id, ok: true, payload });
 		}
 	}
 

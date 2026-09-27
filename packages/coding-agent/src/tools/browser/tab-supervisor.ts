@@ -210,7 +210,9 @@ const READY_BUDGET_FLOOR_MS = 500;
 // vanished instead of a bare "not alive". Cleared when the name is opened again.
 const killedTabs = new Map<string, string>();
 const DEFAULT_TAB_CLOSE_TIMEOUT_MS = 5_000;
-class RecoverableWorkerError extends ToolError {}
+/** Run errors whose worker also failed to restore tab-scoped state; the tab is recycled before rethrowing. */
+const tabRecoveryErrors = new WeakSet<Error>();
+const INTERCEPTION_CLEANUP_KILL_REASON = "Browser request interception cleanup failed; tab killed";
 const REPORTED_INIT_FAILURE = Symbol("reported-init-failure");
 
 type ReportedInitFailure = Error & { [REPORTED_INIT_FAILURE]?: true };
@@ -729,8 +731,9 @@ async function runInTabWithSnapshot(
 			timeoutMs: opts.timeoutMs,
 			session: snapshot,
 		});
+		let result: RunResultOk;
 		try {
-			return await raceWithTimeout(
+			result = await raceWithTimeout(
 				promise,
 				opts.timeoutMs + GRACE_MS,
 				"Browser code execution hung past grace; tab killed",
@@ -739,25 +742,22 @@ async function runInTabWithSnapshot(
 		} catch (error) {
 			const runTimedOut =
 				error instanceof ToolError && error.message.startsWith("Browser code execution timed out after ");
-			if (runTimedOut || error instanceof RecoverableWorkerError) {
-				try {
-					if (tab.worker.mode === "inline") {
-						const reason = runTimedOut
-							? "Browser code execution timed out; tab killed"
-							: "Browser request interception cleanup failed; tab killed";
-						await forceKillTab(name, reason);
-					} else {
-						await recycleTimedOutWorkerTab(tab, opts.timeoutMs + GRACE_MS);
-					}
-				} catch (recycleError) {
-					logger.warn("Failed to recycle browser tab worker; killing tab", {
-						error: recycleError instanceof Error ? recycleError.message : String(recycleError),
-					});
-					await forceKillTab(name, "Browser tab worker recovery failed; tab killed");
-				}
+			if (runTimedOut) {
+				await recoverWorkerTab(tab, name, opts.timeoutMs, "Browser code execution timed out; tab killed");
+			} else if (error instanceof Error && tabRecoveryErrors.has(error)) {
+				await recoverWorkerTab(tab, name, opts.timeoutMs, INTERCEPTION_CLEANUP_KILL_REASON);
 			}
 			throw error;
 		}
+		const { recoverTab, ...ok } = result;
+		if (!recoverTab) return ok;
+		// The run succeeded; only the post-run network reset failed. Return its result
+		// and reset the tab so later calls do not inherit a stale interception state.
+		const survived = await recoverWorkerTab(tab, name, opts.timeoutMs, INTERCEPTION_CLEANUP_KILL_REASON);
+		const note = survived
+			? `Tab ${JSON.stringify(name)} was reattached to reset its network state.`
+			: `Tab ${JSON.stringify(name)} was closed to reset its network state; open it again to continue.`;
+		return { ...ok, warnings: [...(ok.warnings ?? []), note] };
 	} finally {
 		opts.signal?.removeEventListener("abort", abort);
 		tab.pending.delete(id);
@@ -1564,16 +1564,42 @@ async function targetIdForTarget(target: Target): Promise<string> {
 	}
 }
 
+/**
+ * Reset a worker tab whose run left it in an unknown state: reattach a fresh
+ * worker, or kill the tab when that is impossible (an inline worker cannot be
+ * terminated) or fails. Returns whether the tab is still alive.
+ */
+async function recoverWorkerTab(
+	tab: WorkerTabSession,
+	name: string,
+	timeoutMs: number,
+	inlineKillReason: string,
+): Promise<boolean> {
+	try {
+		if (tab.worker.mode === "inline") {
+			await forceKillTab(name, inlineKillReason);
+			return false;
+		}
+		await recycleTimedOutWorkerTab(tab, timeoutMs + GRACE_MS);
+		return true;
+	} catch (recycleError) {
+		logger.warn("Failed to recycle browser tab worker; killing tab", {
+			error: recycleError instanceof Error ? recycleError.message : String(recycleError),
+		});
+		await forceKillTab(name, "Browser tab worker recovery failed; tab killed");
+		return false;
+	}
+}
+
 function errorFromPayload(payload: RunErrorPayload): Error {
-	const error = payload.recoverTab
-		? new RecoverableWorkerError(payload.message)
-		: payload.isAbort
-			? new ToolAbortError()
-			: payload.isToolError
-				? new ToolError(payload.message)
-				: new Error(payload.message);
+	const error = payload.isAbort
+		? new ToolAbortError()
+		: payload.isToolError
+			? new ToolError(payload.message)
+			: new Error(payload.message);
 	error.name = payload.name;
 	if (payload.stack) error.stack = payload.stack;
+	if (payload.recoverTab) tabRecoveryErrors.add(error);
 	return error;
 }
 

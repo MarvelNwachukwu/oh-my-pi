@@ -120,6 +120,10 @@ export interface RunResultOk {
 	displays: Array<TextContent | ImageContent>;
 	returnValue: unknown;
 	screenshots: ScreenshotResult[];
+	/** Non-fatal problems after the run completed, shown alongside its output. */
+	warnings?: string[];
+	/** Worker-to-supervisor only: tab-scoped browser state was not restored, so the tab must be recycled. */
+	recoverTab?: boolean;
 }
 
 export interface RunErrorPayload {

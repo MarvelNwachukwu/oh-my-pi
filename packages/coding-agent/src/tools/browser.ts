@@ -482,7 +482,7 @@ async function runBrowser(
 		details.url = tab.info.url;
 	}
 
-	const { displays, returnValue, screenshots } = await runInTab(name, {
+	const { displays, returnValue, screenshots, warnings } = await runInTab(name, {
 		code,
 		timeoutMs,
 		signal,
@@ -493,6 +493,7 @@ async function runBrowser(
 
 	if (returnValue !== undefined) details.value = returnValue;
 	const content = [...displays];
+	for (const warning of warnings ?? []) content.push({ type: "text", text: `Warning: ${warning}` });
 	const textOnly = content
 		.filter((part): part is { type: "text"; text: string } => part.type === "text")
 		.map(part => part.text)
