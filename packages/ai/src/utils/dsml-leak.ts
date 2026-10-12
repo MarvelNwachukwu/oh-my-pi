@@ -91,7 +91,8 @@ export function stripDsmlToolMarkup(text: string): string | undefined {
 /**
  * Remove leaked DSML tool-call markup from an assistant message before commit,
  * including reasoning blocks and turns with valid structured calls. Rewritten
- * signed reasoning is discarded: its signature authenticates the original text.
+ * thinking with an opaque signature is discarded; OpenAI-compatible reasoning
+ * field names are replay markers, not signatures, and survive cleanup.
  */
 export function removeDsmlToolMarkupLeak(message: AssistantMessage): boolean {
 	let content: AssistantMessage["content"] | undefined;
@@ -109,8 +110,14 @@ export function removeDsmlToolMarkupLeak(message: AssistantMessage): boolean {
 		content ??= message.content.slice(0, index);
 		if (block.type === "text") {
 			if (stripped.trim().length > 0) content.push({ ...block, text: stripped });
-		} else if (!block.thinkingSignature && stripped.trim().length > 0) {
-			content.push({ ...block, thinking: stripped });
+		} else {
+			const signature = block.thinkingSignature;
+			const reasoningField =
+				message.api === "openai-completions" &&
+				(signature === "reasoning_content" || signature === "reasoning" || signature === "reasoning_text");
+			if ((!signature || reasoningField) && stripped.trim().length > 0) {
+				content.push({ ...block, thinking: stripped });
+			}
 		}
 	}
 	if (content) message.content = content;
