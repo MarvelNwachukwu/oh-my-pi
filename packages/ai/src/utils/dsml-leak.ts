@@ -90,8 +90,8 @@ export function stripDsmlToolMarkup(text: string): string | undefined {
 
 /**
  * Remove leaked DSML tool-call markup from an assistant message before commit,
- * including reasoning blocks and turns with valid structured calls. Empty text
- * blocks are dropped; signed reasoning blocks retain their provider signature.
+ * including reasoning blocks and turns with valid structured calls. Rewritten
+ * signed reasoning is discarded: its signature authenticates the original text.
  */
 export function removeDsmlToolMarkupLeak(message: AssistantMessage): boolean {
 	let content: AssistantMessage["content"] | undefined;
@@ -109,7 +109,7 @@ export function removeDsmlToolMarkupLeak(message: AssistantMessage): boolean {
 		content ??= message.content.slice(0, index);
 		if (block.type === "text") {
 			if (stripped.trim().length > 0) content.push({ ...block, text: stripped });
-		} else if (stripped.trim().length > 0 || block.thinkingSignature) {
+		} else if (!block.thinkingSignature && stripped.trim().length > 0) {
 			content.push({ ...block, thinking: stripped });
 		}
 	}

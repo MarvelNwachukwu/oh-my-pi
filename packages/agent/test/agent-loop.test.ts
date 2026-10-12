@@ -254,11 +254,8 @@ describe("agentLoop with AgentMessage", () => {
 			responses: [
 				{
 					content: [
-						{
-							type: "thinking",
-							thinking: "Plan.</｜｜DSML｜｜parameter>",
-							thinkingSignature: "reasoning_content",
-						},
+						{ type: "thinking", thinking: "Plan.</｜｜DSML｜｜parameter>" },
+						{ type: "thinking", thinking: "Signed.</｜｜DSML｜｜parameter>", thinkingSignature: "signed" },
 						"Checking the build.</｜｜DSML｜｜invoke>",
 					],
 				},
@@ -270,7 +267,7 @@ describe("agentLoop with AgentMessage", () => {
 		const messages = await agentLoop([createUserMessage("Hello")], context, config, undefined, mock.stream).result();
 
 		expect((messages[1] as AssistantMessage).content).toEqual([
-			{ type: "thinking", thinking: "Plan.", thinkingSignature: "reasoning_content" },
+			{ type: "thinking", thinking: "Plan." },
 			{ type: "text", text: "Checking the build." },
 		]);
 		expect(messages.map(message => message.role)).toEqual(["user", "assistant", "developer", "assistant"]);
@@ -306,7 +303,6 @@ describe("agentLoop with AgentMessage", () => {
 
 		expect(executions).toEqual(["build passed"]);
 		expect((messages[1] as AssistantMessage).content).toEqual([
-			{ type: "thinking", thinking: "Ready.", thinkingSignature: "reasoning_content" },
 			expect.objectContaining({ type: "toolCall", name: "echo" }),
 			{ type: "text", text: "Reported." },
 		]);
