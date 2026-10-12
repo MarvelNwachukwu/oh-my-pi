@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept leaked DeepSeek DSML markup out of saved tool-call turns and the transcript.
+
 ## [18.10.2] - 2026-10-12
 
 ### Added

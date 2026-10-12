@@ -13,8 +13,8 @@
 import type { AssistantMessage, Model } from "../types";
 
 // Structural DSML tags in either pipe spelling (fullwidth `｜` U+FF5C or ASCII),
-// tolerating stray whitespace inside the delimiter run.
-const DSML_TAG_PATTERN = /<\s*\/?\s*[｜|]\s*DSML\s*[｜|]\s*(?:tool_calls|invoke|parameter)\b[^<>]*>?/gu;
+// including doubled delimiters and the observed malformed ` calls` wrapper.
+const DSML_TAG_PATTERN = /<\s*\/?\s*[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*(?:tool_calls|invoke|parameter|calls)\b[^<>]*>?/gu;
 // Code the model deliberately quoted (fences, inline spans) is not a leak.
 const QUOTED_CODE_PATTERN = /(```|~~~)[\s\S]*?(?:\1|$)|`[^`\n]*`/g;
 // The identifier-only line a degraded model writes in place of
@@ -89,21 +89,30 @@ export function stripDsmlToolMarkup(text: string): string | undefined {
 }
 
 /**
- * Remove leaked DSML tool-call markup from `message`'s text blocks in place,
- * dropping blocks left empty. Returns true when anything was removed.
+ * Remove leaked DSML tool-call markup from an assistant message before commit,
+ * including reasoning blocks and turns with valid structured calls. Empty text
+ * blocks are dropped; signed reasoning blocks retain their provider signature.
  */
 export function removeDsmlToolMarkupLeak(message: AssistantMessage): boolean {
-	let removed = false;
-	const content: AssistantMessage["content"] = [];
-	for (const block of message.content) {
-		const stripped = block.type === "text" ? stripDsmlToolMarkup(block.text) : undefined;
-		if (block.type !== "text" || stripped === undefined) {
-			content.push(block);
+	let content: AssistantMessage["content"] | undefined;
+	for (let index = 0; index < message.content.length; index++) {
+		const block = message.content[index]!;
+		if (block.type !== "text" && block.type !== "thinking") {
+			content?.push(block);
 			continue;
 		}
-		removed = true;
-		if (stripped.trim().length > 0) content.push({ ...block, text: stripped });
+		const stripped = stripDsmlToolMarkup(block.type === "text" ? block.text : block.thinking);
+		if (stripped === undefined) {
+			content?.push(block);
+			continue;
+		}
+		content ??= message.content.slice(0, index);
+		if (block.type === "text") {
+			if (stripped.trim().length > 0) content.push({ ...block, text: stripped });
+		} else if (stripped.trim().length > 0 || block.thinkingSignature) {
+			content.push({ ...block, thinking: stripped });
+		}
 	}
-	if (removed) message.content = content;
-	return removed;
+	if (content) message.content = content;
+	return content !== undefined;
 }

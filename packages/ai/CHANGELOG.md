@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Removed doubled-pipe DeepSeek DSML markup from assistant text and reasoning on OpenAI-compatible gateways.
+
 ## [18.10.2] - 2026-10-12
 
 ### Added
