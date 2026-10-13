@@ -1,5 +1,6 @@
 import { type } from "@oh-my-pi/omptype";
-import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { replaceTabs, TERMINAL } from "@oh-my-pi/pi-tui";
 import { isRecord, logger, untilAborted } from "@oh-my-pi/pi-utils";
 import type { EvalPreludeContext, EvalPreludeDefinition } from "../eval/preludes";
 import type { ToolSession } from "../sdk";
@@ -21,7 +22,7 @@ import { describeTernTargets, listTernBlocks, type TernTarget, ternTargets } fro
 import { resolveTernKind } from "./browser/tern/kind";
 import { isTernUnavailable } from "./browser/tern/wire";
 import type { AriaSnapshotOptions } from "./browser/aria/aria-snapshot";
-import type { ScreenshotResult } from "./browser/tab-protocol";
+import type { RunResultOk, ScreenshotResult, TabHandoffEvent } from "./browser/tab-protocol";
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
 import {
 	type AcquireTabResult,
@@ -41,10 +42,11 @@ import {
 import { renderTabCall } from "./browser/tab-call";
 import { resolveToCwd } from "./path-utils";
 import { renderCallChain, renderFunctionRun } from "./run-code";
+import { CELL_BUDGET_SLACK_MS } from "./run-scope";
 import { ToolAbortError, throwIfAborted } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
-import { clampTimeout } from "./tool-timeouts";
+import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
 
 import {
 	cfgBrowserCdpUrl,
@@ -56,6 +58,7 @@ import {
 	cfgBrowserTern,
 } from "./browser/settings";
 import { cfgToolsMaxTimeout } from "./settings";
+import { cfgAskNotify } from "../modes/settings";
 
 export type { AriaSnapshotOptions } from "./browser/aria/aria-snapshot";
 
@@ -104,6 +107,7 @@ const appSchema = type({
 	"target?": type("string").describe(
 		"URL/title substring picking the page to drive; inside Tern, adopts the user's browser block (or its id)",
 	),
+	"adopt?": type("'visible'").describe("relay: explicitly navigate the visible tab even when url is set"),
 });
 
 const tabCallStepSchema = type({
@@ -319,7 +323,11 @@ async function invokeBrowser(
 
 	try {
 		throwIfAborted(context.signal);
-		const timeoutSeconds = clampTimeout("browser", parsed.timeout, cfgToolsMaxTimeout.get(session.settings));
+		const timeoutSeconds = clampTimeout(
+			"browser",
+			parsed.timeout ?? handoffBudgetSeconds(parsed),
+			cfgToolsMaxTimeout.get(session.settings),
+		);
 		const timeoutMs = timeoutSeconds * 1000;
 		const name = parsed.name ?? DEFAULT_TAB_NAME;
 		const details: BrowserPreludeDetails = { action: parsed.action, name };
@@ -336,7 +344,7 @@ async function invokeBrowser(
 				return await listTargets(session, parsed, details, timeoutMs, context.signal);
 			case "run":
 			case "call":
-				return await runBrowser(session, name, parsed, details, timeoutMs, context.signal);
+				return await runBrowser(session, name, parsed, details, timeoutMs, context.signal, context.context);
 		}
 	} catch (error) {
 		if (error instanceof ToolAbortError) throw error;
@@ -487,6 +495,7 @@ async function openOnKind(
 							}
 						: undefined,
 					target: params.app?.target,
+					adopt: params.app?.adopt,
 					timeoutMs,
 					deadlineStartMs: deadlineStart,
 					dialogs: params.dialogs,
@@ -627,6 +636,39 @@ function resolveBrowserRunCode(params: BrowserParams): string {
 	return code ?? "";
 }
 
+/** A direct handoff needs its own human timeout plus cell cleanup slack, not the default 30 seconds. */
+function handoffBudgetSeconds(params: BrowserParams): number | undefined {
+	const root = params.action === "call" ? params.chain?.[0] : undefined;
+	if (root?.method !== "handoff") return undefined;
+	const options = root.args[0];
+	const timeout = isRecord(options) ? options.timeout : undefined;
+	if (typeof timeout === "number" && timeout > 0) return Math.ceil((timeout + CELL_BUDGET_SLACK_MS) / 1000);
+	return TOOL_TIMEOUTS.browser.max;
+}
+
+const HANDOFF_STATUS_KEY = "browser-handoff";
+
+/** Without an interactive UI, the worker rejects instead of waiting on nobody. */
+function createHandoffNotifier(
+	session: ToolSession,
+	context: AgentToolContext | undefined,
+): ((event: TabHandoffEvent) => void) | undefined {
+	const ui = context?.hasUI ? context.ui : undefined;
+	if (!ui) return undefined;
+	return event => {
+		if (event.state === "done") {
+			ui.setStatus(HANDOFF_STATUS_KEY, undefined);
+			return;
+		}
+		const message = replaceTabs(event.message).replace(/\s*\n\s*/g, " ");
+		ui.notify(`Browser tab "${event.tab}" needs you (${event.url}): ${message}`, "warning");
+		ui.setStatus(HANDOFF_STATUS_KEY, `Waiting for you in browser tab "${event.tab}": ${message}`);
+		if (cfgAskNotify.get(session.settings) !== "off") {
+			TERMINAL.sendNotification({ title: "omp", body: message, type: "ask", urgency: "normal", actions: "focus" });
+		}
+	};
+}
+
 async function runBrowser(
 	session: ToolSession,
 	name: string,
@@ -634,6 +676,7 @@ async function runBrowser(
 	details: BrowserPreludeDetails,
 	timeoutMs: number,
 	signal?: AbortSignal,
+	context?: AgentToolContext,
 ): Promise<AgentToolResult<unknown>> {
 	const code = resolveBrowserRunCode(params);
 	const tab = getTab(name);
@@ -642,12 +685,14 @@ async function runBrowser(
 		details.url = tab.info.url;
 	}
 
-	const { displays, returnValue, screenshots } = await runInTab(name, {
-		code,
-		timeoutMs,
-		signal,
-		session,
-	});
+	const onHandoff = createHandoffNotifier(session, context);
+	let result: RunResultOk;
+	try {
+		result = await runInTab(name, { code, timeoutMs, signal, session, onHandoff });
+	} finally {
+		if (onHandoff) context?.ui?.setStatus(HANDOFF_STATUS_KEY, undefined);
+	}
+	const { displays, returnValue, screenshots } = result;
 
 	if (screenshots.length) details.screenshots = screenshots;
 

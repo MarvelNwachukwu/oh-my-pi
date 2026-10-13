@@ -40,6 +40,15 @@ export interface SessionSnapshot {
 	browserScreenshotDir?: string;
 	/** Force non-WebP screenshot encoding (e.g. for Ollama). Unset honors `OMP_NO_WEBP`. */
 	excludeWebP?: boolean;
+	/** A visible user can receive handoff requests from this run. */
+	canHandoff?: boolean;
+}
+
+export interface TabHandoffEvent {
+	state: "waiting" | "done";
+	tab: string;
+	message: string;
+	url: string;
 }
 
 export type WorkerInitPayload =
@@ -159,6 +168,7 @@ export type WorkerOutbound =
 	| { type: "result"; id: string; ok: true; payload: RunResultOk }
 	| { type: "result"; id: string; ok: false; error: RunErrorPayload }
 	| { type: "tool-call"; id: string; runId: string; name: string; args: unknown }
+	| { type: "handoff"; runId: string; event: TabHandoffEvent }
 	| { type: "log"; level: "debug" | "warn" | "error"; msg: string; meta?: Record<string, unknown> }
 	| { type: "closed" };
 

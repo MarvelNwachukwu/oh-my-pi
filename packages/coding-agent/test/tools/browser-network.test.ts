@@ -272,4 +272,29 @@ return "done";`,
 		);
 		expect(next).toEqual({ source: "fixture" });
 	});
+	test("preserves the body failure when interception cleanup also fails", async () => {
+		const invoke = createHost();
+		await invoke({ action: "open", name: "body-and-cleanup-fail", url: `${baseUrl}/` });
+		const failure: unknown = await invoke({
+			action: "run",
+			name: "body-and-cleanup-fail",
+			code: `await page.setRequestInterception(true);
+${STALL_FETCH_DISABLE}
+throw new Error("body failed");`,
+		}).then(
+			() => undefined,
+			error => error,
+		);
+		expect(failure).toBeInstanceOf(Error);
+		if (!(failure instanceof Error)) throw new Error("Expected browser run to fail");
+		expect(failure.message).toBe("body failed");
+		const after = valueOf(
+			await invoke({
+				action: "run",
+				name: "body-and-cleanup-fail",
+				code: `return await tab.evaluate(async url => await (await fetch(url)).json(), ${JSON.stringify(`${baseUrl}/api`)})`,
+			}),
+		);
+		expect(after).toEqual({ source: "fixture" });
+	});
 });

@@ -701,6 +701,36 @@ return await tab.evaluate(() => ({
 			await prelude.invoke({ action: "close", name: tabName, kill: true }, context).catch(() => undefined);
 		}
 	}, 30_000);
+	// A below-fold text node with empty/icon siblings must resolve to its button even
+	// when virtual time is paused and IntersectionObserver cannot deliver callbacks.
+	test("clicks a below-fold text/ match with icon children on a frame-starved tab", async () => {
+		const session = makeSession();
+		const prelude = createBrowserPrelude(session);
+		const name = `text-click-${crypto.randomUUID()}`;
+		const textHtml = `<!doctype html><div style="height: 3000px"></div>
+<button onclick="window.clicks = (window.clicks || 0) + 1">Stattdessen hier schreiben<span></span><span aria-hidden="true"><svg width="10" height="10"></svg></span></button>`;
+		const context = { session, toolCallId: "browser-text-click" };
+		await prelude.invoke({ action: "open", name, url: `data:text/html,${encodeURIComponent(textHtml)}` }, context);
+		try {
+			const result = await prelude.invoke(
+				{
+					action: "run",
+					name,
+					code: `await tab.click("text/Stattdessen hier schreiben");
+await tab.evaluate(() => window.scrollTo(0, 0));
+const cdp = await page.createCDPSession();
+await cdp.send("Emulation.setVirtualTimePolicy", { policy: "pause" });
+await tab.click("text/Stattdessen hier schreiben");
+return await tab.evaluate(() => window.clicks);`,
+					timeout: 25,
+				},
+				context,
+			);
+			expect(valueFrom<number>(result)).toBe(2);
+		} finally {
+			await prelude.invoke({ action: "close", name, kill: true }, context).catch(() => undefined);
+		}
+	}, 40_000);
 });
 
 describe.skipIf(!CHROMIUM_AVAILABLE)("browser element handle clicks", () => {

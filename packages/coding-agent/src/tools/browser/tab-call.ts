@@ -53,6 +53,7 @@ export const TAB_VALUE_METHODS: readonly string[] = [
 	"select",
 	"uploadFile",
 	"waitForUrl",
+	"handoff",
 	"text",
 	"html",
 	"value",

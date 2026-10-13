@@ -1220,6 +1220,10 @@ export class CmuxTab implements InProcessRunTab {
 		}
 		throw new ToolError(`tab.waitForUrl() timed out after ${timeoutMs}ms`);
 	}
+	/** Handoff relies on CDP focus and the tab worker's host notices. */
+	async handoff(_opts: unknown): Promise<never> {
+		throw new ToolError("tab.handoff() is not supported on the cmux backend");
+	}
 
 	/** Init scripts require CDP document-start registration. */
 	async addInitScript(_source: string): Promise<{ id: string }> {

@@ -214,6 +214,7 @@ import {
 	resolveFrame,
 } from "./frames";
 import { navigateMainFrame, pushState, reloadPage, traverseHistory, type NavigationWaitUntil } from "./navigation";
+import { type HandoffOptions, type HandoffResult, parseHandoffOptions, waitForHandoff } from "./handoff";
 
 import { cloneSafe, RunOutput } from "./run-output";
 import type {
@@ -223,6 +224,7 @@ import type {
 	RunErrorPayload,
 	ScreenshotResult,
 	SessionSnapshot,
+	TabHandoffEvent,
 	ToolReply,
 	Transport,
 	WorkerInbound,
@@ -319,6 +321,8 @@ const SCROLL_ACK_TIMEOUT_MS = 2_000;
 const REQUEST_INTERCEPTION_CLEANUP_TIMEOUT_MS = 500;
 /** Bound cleanup window after a timed-out raw handle action. */
 const HANDLE_ACTION_INVALIDATION_TIMEOUT_MS = 500;
+/** Bound for raising the tab/window before a handoff; focusing is best-effort. */
+const HANDOFF_FOCUS_TIMEOUT_MS = 2_000;
 /** Bound on reading every iframe in one observation; a frame whose renderer is stuck in script never answers. */
 const FRAME_SNAPSHOT_TIMEOUT_MS = 5_000;
 /** Bound on Puppeteer exposing a page Chromium still has; the supervisor's init budget caps the whole attach anyway. */
@@ -372,6 +376,7 @@ interface TabApi {
 	select(selector: string, ...values: string[]): Promise<string[]>;
 	uploadFile(selector: string, ...filePaths: string[]): Promise<void>;
 	waitForUrl(pattern: string | RegExp, opts?: { timeout?: number }): Promise<string>;
+	handoff(opts: HandoffOptions): Promise<HandoffResult>;
 	waitForResponse(
 		pattern: string | RegExp | ((response: HTTPResponse) => boolean | Promise<boolean>),
 		opts?: { timeout?: number },
@@ -874,8 +879,6 @@ function redactUrlCredentials(url: string): string {
 	}
 }
 
-class RequestInterceptionCleanupError extends ToolError {}
-
 /** `tab.goto` outlasted its budget; the page stays on what loaded. */
 class NavigationTimeoutError extends ToolError {}
 
@@ -1008,19 +1011,15 @@ function createRunPageScope(page: Page, restoreInterception: () => Promise<void>
 					"Timed out restoring browser request interception",
 				);
 			} catch (error) {
-				throw new RequestInterceptionCleanupError(
-					"Failed to restore browser request interception after browser.run",
-					{
-						error: error instanceof Error ? error.message : String(error),
-					},
-				);
+				throw new ToolError("Failed to restore browser request interception after browser.run", {
+					error: error instanceof Error ? error.message : String(error),
+				});
 			}
 		},
 	};
 }
 
 function errorPayload(error: unknown): RunErrorPayload {
-	const recoverTab = error instanceof RequestInterceptionCleanupError || undefined;
 	const navigationTimeout = error instanceof NavigationTimeoutError || undefined;
 	const rendererCrashed = error instanceof RendererCrashedError || undefined;
 	if (error instanceof ToolAbortError) {
@@ -1033,7 +1032,6 @@ function errorPayload(error: unknown): RunErrorPayload {
 			stack: error.stack,
 			isToolError: true,
 			isAbort: false,
-			recoverTab,
 			navigationTimeout,
 			rendererCrashed,
 		};
@@ -1873,15 +1871,13 @@ export class WorkerCore {
 			try {
 				await runPage?.restoreInterception();
 			} catch (error) {
-				// A finished run keeps its result; the supervisor still recycles the tab.
-				if (completed && active.floatingRejections.length === 0) {
-					recoverTab = true;
-					this.#log("warn", "Browser tab state could not be restored after a completed run", {
-						error: error instanceof Error ? error.message : String(error),
-					});
-				} else {
-					failure = { error };
-				}
+				// Restore failure requires recycling the tab, but must not replace
+				// the run's own error (or a completed run's result).
+				recoverTab = true;
+				if (!failure && !completed) failure = { error };
+				this.#log("warn", "Browser tab state could not be restored after a run", {
+					error: error instanceof Error ? error.message : String(error),
+				});
 			}
 			failure = this.#foldFloatingRejections(active, failure);
 			if (this.#active?.id === msg.id) this.#active = null;
@@ -1890,7 +1886,9 @@ export class WorkerCore {
 		if (this.#unanswered !== active) return;
 		if (failure) {
 			this.#unanswered = null;
-			this.#transport.send({ type: "result", id: msg.id, ok: false, error: errorPayload(failure.error) });
+			const error = errorPayload(failure.error);
+			if (recoverTab) error.recoverTab = true;
+			this.#transport.send({ type: "result", id: msg.id, ok: false, error });
 			return;
 		}
 		if (completed) {
@@ -2383,6 +2381,17 @@ export class WorkerCore {
 				const w = waitMs(opts?.timeout);
 				return op("tab.waitForUrl()", w, sig => this.#waitForUrl(pattern, w, sig));
 			},
+			handoff: raw =>
+				op("tab.handoff()", INF, sig => {
+					const opts = parseHandoffOptions(raw);
+					if (!session.canHandoff) {
+						throw new ToolError(
+							"tab.handoff() needs an interactive omp session: no user would see the request. Call it as a direct tab helper from Eval in the interactive UI.",
+						);
+					}
+					const w = opts.timeout === undefined ? budgetBound : waitMs(opts.timeout);
+					return this.#handoff(active, name, opts, w, sig);
+				}),
 			waitForResponse: (pattern, opts) => {
 				const w = waitMs(opts?.timeout);
 				return op("tab.waitForResponse()", w, sig => this.#waitForResponse(pattern, w, sig));
@@ -3079,6 +3088,56 @@ export class WorkerCore {
 		} finally {
 			await handle.dispose().catch(() => undefined);
 		}
+	}
+
+	/**
+	 * Hand the tab to the user: focus it, announce the request to the host UI,
+	 * then wait read-only for a completion signal.
+	 */
+	async #handoff(
+		active: ActiveRun,
+		name: string,
+		opts: HandoffOptions,
+		timeoutMs: number,
+		signal: AbortSignal,
+	): Promise<HandoffResult> {
+		const page = this.#requirePage();
+		await this.#focusTab(page, signal);
+		const notice = (state: TabHandoffEvent["state"]): void =>
+			this.#transport.send({
+				type: "handoff",
+				runId: active.id,
+				event: { state, tab: name, message: opts.message, url: redactUrlCredentials(page.url()) },
+			});
+		notice("waiting");
+		try {
+			return await waitForHandoff(page, opts.until, { timeoutMs, signal, normalizeSelector });
+		} finally {
+			notice("done");
+		}
+	}
+
+	/** CDP focus works on relay windows; Page.bringToFront is the bounded fallback. */
+	async #focusTab(page: Page, signal: AbortSignal): Promise<void> {
+		const bounded = AbortSignal.any([signal, AbortSignal.timeout(HANDOFF_FOCUS_TIMEOUT_MS)]);
+		try {
+			const targetId = this.#targetId ?? (await untilAborted(bounded, () => targetIdForPage(page)));
+			const session = await untilAborted(bounded, () => page.createCDPSession());
+			try {
+				const connection = session.connection();
+				if (!connection) throw new Error("CDP connection unavailable");
+				await untilAborted(bounded, () => connection.send("Target.activateTarget", { targetId }));
+				return;
+			} finally {
+				void session.detach().catch(() => undefined);
+			}
+		} catch (error) {
+			signal.throwIfAborted();
+			this.#log("debug", "Target.activateTarget failed; falling back to Page.bringToFront", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		await untilAborted(bounded, () => page.bringToFront()).catch(() => signal.throwIfAborted());
 	}
 
 	async #waitForUrl(pattern: string | RegExp, timeout: number, signal: AbortSignal): Promise<string> {

@@ -1132,6 +1132,11 @@ export class TernTab implements InProcessRunTab {
 		);
 	}
 
+	/** The Tern surface cannot raise a browser tab or deliver worker handoff notices. */
+	async handoff(_opts: unknown): Promise<never> {
+		throw new ToolError("tab.handoff() is not supported on the Tern backend");
+	}
+
 	/** The current URL (as last reported). */
 	url(): string {
 		return this.#url;
